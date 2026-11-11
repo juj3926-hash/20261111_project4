@@ -31,11 +31,13 @@ def _result_text(r: SendResult) -> str:
 class Sequencer:
     """자동 순서(auto_cycle)와 버튼(press, send_code, buttons)."""
 
-    def __init__(self, link: PlcLink, move_timeout=120.0, grip_timeout=6.0,
+    # D3: normal 측정(logs/eval_normal_20261111_105358_066_33612.log) 최대값 × 1.5. 이동은 즉시 정지 허용 30초를 더한다
+    #     이동 2.24 × 1.5 ≈ 3.4 + 30 = 33.4초, 그리퍼 3.05 × 1.5 ≈ 4.6초
+    def __init__(self, link: PlcLink, move_timeout=33.4, grip_timeout=4.6,
                  log: Callable[[str, str], None] | None = None):
         self.link = link
         self.move_timeout = move_timeout  # 이동 한 번의 한도. 즉시 정지·재개 시간도 들어간다
-        self.grip_timeout = grip_timeout  # 그리퍼 3초 + 여유
+        self.grip_timeout = grip_timeout  # 그리퍼 측정 최대 3.05초 × 1.5. 준비 확인 대기 한도로도 쓴다
         self.log = log or (lambda tag, text: None)  # 태그는 "자동"과 "버튼"
         self.running = False  # 자동 순서 중
         self.step = ""  # 자동 순서 단계 (화면용)
@@ -135,7 +137,60 @@ class Sequencer:
         - 시작하면 반복을 작업으로 띄우고 곧바로 돌려준다(press("start")처럼 끝까지 기다리지 않는다).
         - 반복이 끝나면 repeating은 거짓, last_result는 "완료 k/N", "정지 k/N", "중단 k/N: 이유" 중 하나다.
         """
-        raise NotImplementedError("평가 과제: start_repeat를 결정서대로 구현하세요")
+        # D1: 판단부터 표시·작업 띄우기까지 await가 없다. 그 사이에 다른 버튼 코루틴이 끼어들 수 없다
+        if type(count) is not int or not 1 <= count <= 5:
+            return self._say("반복 시작 안 됨: 횟수는 1~5 정수입니다 (%r)" % (count,))
+        why = "반복 중" if self.repeating else self._why_off("start")
+        if why:
+            return self._say("반복 시작 안 됨: %s" % why)
+        self.repeating = self.running = True  # D1: 판단 직후 await 없이 실행 중 표시
+        self.repeat_total, self.repeat_done, self.last_result = count, 0, ""
+        self._task = asyncio.create_task(self._repeat(count))  # D1: 반복 전체가 작업 하나. close()가 이 작업을 끊는다
+        return self._say("반복 시작: %d회" % count)
+
+    def _ready(self, s: Status) -> bool:
+        """시작 버튼의 준비 조건: 로봇 정지, 그리퍼 열림·동작 아님, 복구 불필요."""
+        return s.valid and s.robot == 1 and s.gripper == 0 and not self.grip_pending and not self.auto_maybe_on
+
+    async def _repeat(self, count: int) -> None:
+        """반복 작업 본체. 사이클마다 준비 확인 → 정지 확인 → _cycle()."""
+        n, result = count, None
+        try:
+            while self.repeat_done < n:
+                if self.stop_requested:  # D2: 사이클 사이 정지 (앞 사이클 완료 관측 뒤)
+                    result = "정지 %d/%d" % (self.repeat_done, n)
+                    break
+                self._set_step("반복 %d/%d 준비 확인" % (self.repeat_done + 1, n))
+                # D4: link.status를 그대로 쓰지 않고, 이 호출 뒤에 도착한 새 정상 읽기로 준비 조건을 본다
+                # D3: 준비 확인 대기의 한도는 grip_timeout
+                await self._until(self._ready, self.grip_timeout)
+                if self.stop_requested:  # D2: 1111 직전 확인. 이 뒤 _accept(START)까지 await가 없다
+                    result = "정지 %d/%d" % (self.repeat_done, n)
+                    break
+                r = await self._cycle()  # auto_cycle()은 부르지 않는다: 그 finally가 running·stop_requested를 지운다
+                if r == "정지":
+                    result = "정지 %d/%d" % (self.repeat_done, n)
+                    break
+                self.repeat_done += 1  # 규칙 1: _cycle()의 "완료"는 5단계 열림을 새 읽기로 확인한 뒤에만 나온다
+                self._log("자동", "반복 %d/%d 완료" % (self.repeat_done, n))
+                # D2: stop_requested는 지우지 않는다. 이동2 뒤 들어온 정지가 다음 루프 맨 앞에서 반영된다
+            else:
+                result = "완료 %d/%d" % (self.repeat_done, n)
+        except Abort as e:
+            self.auto_maybe_on = True
+            result = "중단 %d/%d: %s" % (self.repeat_done, n, e)
+        except asyncio.CancelledError:  # close()
+            result = "중단 %d/%d: 프로그램 종료" % (self.repeat_done, n)
+            raise
+        except Exception as e:
+            traceback.print_exc()
+            self.auto_maybe_on = True
+            result = "중단 %d/%d: 예외 %r" % (self.repeat_done, n, e)
+        finally:
+            self.repeating = self.running = self.stop_requested = False  # D1: 반복이 끝날 때 표시를 내린다
+            self.step = ""
+            self.last_result = result or "중단 %d/%d: 알 수 없음" % (self.repeat_done, n)
+            self._log("자동", "반복 결과: %s" % self.last_result)
 
     async def close(self) -> None:
         """프로그램을 끝낼 때 부른다. 돌고 있는 자동 순서를 멈추고 한 줄을 남긴다.
